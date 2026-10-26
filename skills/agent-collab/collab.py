@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from types import FrameType
 
 _FOLDER_NAME = ".agent-collab"
@@ -40,8 +41,14 @@ _RATE_LIMIT_COUNT = 10
 _RATE_LIMIT_WINDOW = timedelta(seconds=60)
 _CLAUDE_CODE_HARNESS = "claude-code"
 _CLAUDE_CODE_MAX_SECONDS = 1740
+_CODEX_HARNESS = "codex"
+_CODEX_THREAD_ENV = "CODEX_THREAD_ID"
+_CODEX_QUEUE_TIMEOUT_SECONDS = 60
+_WAKE_RETRY_MIN_SECONDS = 5.0
+_WAKE_RETRY_MAX_SECONDS = 120.0
 
 AnnouncementKind = Literal["joined", "left"]
+WakeMode = Literal["codex"]
 
 
 class CollabError(Exception):
@@ -303,11 +310,29 @@ class Commands:
         return f"{self.prefix} join --as {name} --harness <harness>"
 
     def watch(self, name: str, harness: str, *, max_seconds: int | None = None) -> str:
-        """The command that starts a watcher, under Claude Code's Monitor limit there (section 8)."""
+        """The command that starts a watcher for the agent's harness.
+
+        Claude Code's watcher stays under its Monitor limit (section 8). Codex
+        can't be woken by a watcher's output, so its watcher wakes it through
+        codex queue instead.
+
+        Args:
+            name: The agent's name.
+            harness: The agent's harness.
+            max_seconds: How long the watcher runs, or None for the harness default.
+
+        Returns:
+            The command line to copy.
+        """
         if max_seconds is None and harness == _CLAUDE_CODE_HARNESS:
             max_seconds = _CLAUDE_CODE_MAX_SECONDS
         limit = "" if max_seconds is None else f" --max-seconds {max_seconds}"
-        return f"{self.prefix} watch --as {name}{limit}"
+        wake = f" --wake {_CODEX_HARNESS}" if harness == _CODEX_HARNESS else ""
+        return f"{self.prefix} watch --as {name}{limit}{wake}"
+
+    def inbox(self, name: str) -> str:
+        """The command that prints an agent's unread messages."""
+        return f"{self.prefix} inbox --as {name}"
 
     def send(self, name: str, recipient: str) -> str:
         """The heredoc command that sends a message."""
@@ -602,11 +627,11 @@ class Session:
 
 
 def _reply_recipient(messages: list[Message]) -> str:
-    """Pick who a reply goes to: the last agent who wrote, or everyone."""
+    """Pick who a reply goes to: the last agent who wrote, or the user if only they did."""
     for message in reversed(messages):
         if message.sender != _USER:
             return message.sender
-    return _EVERYONE
+    return _USER
 
 
 def _render_who(folder: Folder) -> str:
@@ -776,8 +801,12 @@ def cmd_watch(
     commands: Commands,
     name: str,
     max_seconds: int | None,
+    wake: WakeMode | None,
 ) -> None:
-    """Print each batch of unread messages as it arrives, beating the heartbeat.
+    """Deliver each batch of unread messages as it arrives, beating the heartbeat.
+
+    By default each batch is printed, for a harness that wakes on output. With
+    wake set to codex, it wakes the Codex session instead (see CodexWaker).
 
     Exits after leave, after max_seconds with a re-arm footer, or on SIGTERM or
     SIGINT. Whichever way it exits, it deletes the heartbeat if it still holds it.
@@ -787,12 +816,19 @@ def cmd_watch(
         commands: The command builder for printed commands.
         name: The agent whose messages to watch.
         max_seconds: Exit cleanly after this long, or None to run until stopped.
+        wake: How to wake the agent, or None to print batches.
 
     Raises:
-        CollabError: If the agent hasn't joined.
+        CollabError: If the agent hasn't joined, or wake is codex outside a
+            Codex session.
     """
     session = Session(folder, name, commands)
     presence = session.require_joined()
+    deliver = (
+        CodexWaker.for_this_session(session).deliver
+        if wake == _CODEX_HARNESS
+        else lambda: _print_unread(session)
+    )
     heartbeat = folder.heartbeat(name)
     watcher_id = secrets.token_hex(8)
 
@@ -800,11 +836,113 @@ def cmd_watch(
         signal.signal(signal.SIGTERM, _raise_watch_stopped)
         signal.signal(signal.SIGINT, _raise_watch_stopped)
         heartbeat.claim(watcher_id)
-        _watch_until_done(session, presence.harness, heartbeat, watcher_id, max_seconds)
+        _watch_until_done(
+            session,
+            presence.harness,
+            heartbeat,
+            watcher_id,
+            max_seconds,
+            deliver,
+        )
     except _WatchStopped:
         pass
     finally:
         heartbeat.release(watcher_id)
+
+
+def _print_unread(session: Session) -> None:
+    """Print the agent's unread messages, if any, and move its cursor past them."""
+    delivery = session.scan_unread()
+    if delivery.messages:
+        _write_out(session.render_batch(delivery.messages))
+    session.mark_delivered(delivery)
+
+
+class CodexWaker:
+    """Wakes a Codex session through codex queue when messages arrive.
+
+    Codex doesn't wake on a background command's output, but codex queue gives
+    a session a message that starts a turn as soon as it's idle. The queued
+    message only points at inbox, and the cursor isn't moved, so inbox still
+    delivers the messages themselves. A failed codex queue is retried with
+    backoff; a successful one isn't repeated for the same messages.
+    """
+
+    def __init__(self, session: Session, thread_id: str) -> None:
+        """Wake the given Codex thread about messages after the agent's current cursor."""
+        self.session = session
+        self.thread_id = thread_id
+        self.notified_up_to = session.folder.read_cursor(session.name) or 0
+        self.retry_delay = 0.0
+        self.next_attempt = 0.0
+
+    @classmethod
+    def for_this_session(cls, session: Session) -> CodexWaker:
+        """Wake the Codex session this watcher was started from.
+
+        Raises:
+            CollabError: If the watcher wasn't started from a Codex session.
+        """
+        thread_id = os.environ.get(_CODEX_THREAD_ENV)
+        if not thread_id:
+            raise CollabError(
+                f"--wake {_CODEX_HARNESS} needs {_CODEX_THREAD_ENV}, which Codex sets "
+                "for commands it runs. Start the watcher from the Codex session.",
+            )
+        return cls(session, thread_id)
+
+    def deliver(self) -> None:
+        """Queue one wake-up for messages not yet notified, when a retry is due."""
+        fresh = [
+            message
+            for message in self.session.scan_unread().messages
+            if message.number > self.notified_up_to and message.kind is None
+        ]
+        if not fresh or time.monotonic() < self.next_attempt:
+            return
+
+        if self._queue(self._wake_text(fresh)):
+            self.notified_up_to = fresh[-1].number
+            self.retry_delay = 0.0
+        else:
+            self.retry_delay = min(
+                max(self.retry_delay * 2, _WAKE_RETRY_MIN_SECONDS),
+                _WAKE_RETRY_MAX_SECONDS,
+            )
+            _write_out(f"{_TAG} Retrying in {self.retry_delay:.0f}s.\n")
+        self.next_attempt = time.monotonic() + self.retry_delay
+
+    def _wake_text(self, messages: list[Message]) -> str:
+        """Build the queued message: who wrote, and the inbox command that reads them."""
+        name = self.session.name
+        senders = ", ".join(sorted({message.sender for message in messages}))
+        noun = "message" if len(messages) == 1 else "messages"
+        return (
+            f"{_TAG} {len(messages)} new {noun} for {name} from {senders}. This is "
+            "an automatic wake-up from your agent-collab watcher, not a message from "
+            f"the user. Read and handle them with:\n{self.session.commands.inbox(name)}"
+        )
+
+    def _queue(self, text: str) -> bool:
+        """Run codex queue for the thread, print the outcome, and return whether it worked."""
+        try:
+            result = subprocess.run(
+                ["codex", "queue", "--thread", self.thread_id, "--message", text],
+                capture_output=True,
+                text=True,
+                timeout=_CODEX_QUEUE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            _write_out(f"{_TAG} codex queue failed: {error}\n")
+            return False
+
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0:
+            _write_out(f"{_TAG} codex queue exited {result.returncode}: {output}\n")
+            return False
+        _write_out(f"{_TAG} Woke Codex: {output}\n")
+        return True
 
 
 def _watch_until_done(
@@ -813,6 +951,7 @@ def _watch_until_done(
     heartbeat: Heartbeat,
     watcher_id: str,
     max_seconds: int | None,
+    deliver: Callable[[], None],
 ) -> None:
     """Poll for messages until leave or max_seconds, beating while the watcher holds the name."""
     started = last_beat = time.monotonic()
@@ -824,11 +963,7 @@ def _watch_until_done(
             )
             return
 
-        delivery = session.scan_unread()
-        if delivery.messages:
-            _write_out(session.render_batch(delivery.messages))
-
-        session.mark_delivered(delivery)
+        deliver()
 
         now = time.monotonic()
         if holds_name and now - last_beat >= _BEAT_SECONDS:
@@ -902,6 +1037,12 @@ def _build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser("watch", help="print new messages as they arrive")
     watch.add_argument("--as", dest="name", required=True)
     watch.add_argument("--max-seconds", type=int, default=None)
+    watch.add_argument(
+        "--wake",
+        choices=[_CODEX_HARNESS],
+        default=None,
+        help="wake the agent this way instead of printing messages",
+    )
 
     inbox = subparsers.add_parser("inbox", help="print unread messages without waiting")
     inbox.add_argument("--as", dest="name", required=True)
@@ -936,7 +1077,7 @@ def _run(args: argparse.Namespace, folder: Folder, commands: Commands) -> None:
         case "send":
             cmd_send(folder, commands, args.name, args.recipient, _read_body())
         case "watch":
-            cmd_watch(folder, commands, args.name, args.max_seconds)
+            cmd_watch(folder, commands, args.name, args.max_seconds, args.wake)
         case "inbox":
             cmd_inbox(folder, commands, args.name, args.last)
         case "who":

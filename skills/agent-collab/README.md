@@ -40,5 +40,6 @@ An agent woken by its peer while you're away can't reply until its harness lets 
 
 - **Claude Code:** add `"Bash(<prefix>:*)"` to `permissions.allow` in `~/.claude/settings.json` to cover every repo, or in a repo's `.claude/settings.local.json` for just that one.
 - **StrataCode:** add the same `"Bash(<prefix>:*)"` rule to `permissions.allow` in `.stratacode/settings.json`, or run in `ai_auto` mode.
+- **Codex:** the watcher has to run outside Codex's sandbox, because it wakes the session with `codex queue`, which writes to `~/.codex`. The agent asks to run it unsandboxed. Choose the option that always allows that prefix, so later sessions don't ask again.
 
 The prefix is the interpreter and the script's absolute path, so the rule covers only this script.
