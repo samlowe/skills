@@ -1,6 +1,6 @@
 # skills
 
-Agent skills for coding agents such as Claude Code, Codex, Cursor and StrataCode. Install them with the [`skills` CLI](https://github.com/vercel-labs/skills).
+Agent skills for coding agents such as Claude Code, Codex, Cursor and StrataCode. 
 
 | Skill | What it does | Install |
 | --- | --- | --- |
