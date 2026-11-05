@@ -5,6 +5,7 @@ Agent skills for coding agents such as Claude Code, Codex, Cursor and StrataCode
 | Skill | What it does | Install |
 | --- | --- | --- |
 | [agent-collab](skills/agent-collab/README.md) | Lets two or more coding agents working in the same repo message each other, possibly in different harnesses. | `npx skills add samlowe/skills --skill agent-collab -g` |
+| [delegate](skills/delegate/SKILL.md) | A simpler alternative for messaging one other coding agent via files in `/tmp`, possibly across different harnesses. | `npx skills add samlowe/skills --skill delegate -g` |
 | [bump-version](skills/bump-version/SKILL.md) | Increments the project version in dependency files, lockfiles, and code constants (explicit version or major/minor/patch). | `npx skills add samlowe/skills --skill bump-version -g` |
 | [create-design-md](skills/create-design-md/SKILL.md) | Produces a detailed, review-ready design/plan markdown doc under `docs/plans/`, closing open questions and iterating via subagent review. | `npx skills add samlowe/skills --skill create-design-md -g` |
 | [docstrings](skills/docstrings/SKILL.md) | Ensures touched or scoped functions, methods, and classes have appropriate one-line or full docstrings. | `npx skills add samlowe/skills --skill docstrings -g` |
